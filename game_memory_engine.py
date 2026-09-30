@@ -1,98 +1,68 @@
-import ctypes
-from ctypes import wintypes
+"""Core game memory engine — process attachment, memory scanning, pointer
+resolution, AOB pattern scanning, and value freezing."""
+import math
+import re
 import struct
 import threading
 import time
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import psutil
 
-# Win32 Constants
-PROCESS_ALL_ACCESS = 0x1F0FFF
-PROCESS_VM_READ = 0x0010
-PROCESS_VM_WRITE = 0x0020
-PROCESS_VM_OPERATION = 0x0008
-PROCESS_QUERY_INFORMATION = 0x0400
+from win32_api import (
+    MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS,
+    PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+    PROCESS_VM_READ, PROCESS_VM_WRITE, WRITABLE_PROTECTIONS,
+    CloseHandle, IsWow64Process, OpenProcess, ReadProcessMemory,
+    VirtualQueryEx, WriteProcessMemory, ctypes, wintypes, parse_address
+)
 
-MEM_COMMIT = 0x1000
-MEM_RESERVE = 0x2000
-MEM_FREE = 0x10000
+# ---- Data-type Registry (O(1) lookup) -------------------------------------
+_TYPE_MAP: Dict[str, Tuple[int, str]] = {}
+for _aliases, _sz, _fmt in [
+    (('int', 'int32', 'i32'), 4, '<i'),
+    (('uint', 'uint32', 'u32'), 4, '<I'),
+    (('int64', 'i64', 'long'), 8, '<q'),
+    (('uint64', 'u64', 'ulong'), 8, '<Q'),
+    (('short', 'int16', 'i16'), 2, '<h'),
+    (('ushort', 'uint16', 'u16'), 2, '<H'),
+    (('byte', 'uint8', 'u8'), 1, '<B'),
+    (('float', 'f32'), 4, '<f'),
+    (('double', 'f64'), 8, '<d'),
+]:
+    for _a in _aliases:
+        _TYPE_MAP[_a] = (_sz, _fmt)
 
-PAGE_NOACCESS = 0x01
-PAGE_READONLY = 0x02
-PAGE_READWRITE = 0x04
-PAGE_WRITECOPY = 0x08
-PAGE_EXECUTE = 0x10
-PAGE_EXECUTE_READ = 0x20
-PAGE_EXECUTE_READWRITE = 0x40
-PAGE_EXECUTE_WRITECOPY = 0x80
-PAGE_GUARD = 0x100
+_FLOAT_TYPES = frozenset(('float', 'f32', 'double', 'f64'))
 
-class MEMORY_BASIC_INFORMATION64(ctypes.Structure):
-    _fields_ = [
-        ("BaseAddress", ctypes.c_ulonglong),
-        ("AllocationBase", ctypes.c_ulonglong),
-        ("AllocationProtect", wintypes.DWORD),
-        ("Alignment1", wintypes.DWORD),
-        ("RegionSize", ctypes.c_ulonglong),
-        ("State", wintypes.DWORD),
-        ("Protect", wintypes.DWORD),
-        ("Type", wintypes.DWORD),
-        ("Alignment2", wintypes.DWORD),
-    ]
 
-# Win32 API functions
-kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+def type_size_and_format(data_type: str) -> Tuple[int, str]:
+    """Returns (byte_size, struct_format) for a given type name."""
+    key = data_type.lower()
+    if key in _TYPE_MAP:
+        return _TYPE_MAP[key]
+    raise ValueError(f"Unsupported data type: '{data_type}'")
 
-OpenProcess = kernel32.OpenProcess
-OpenProcess.restype = wintypes.HANDLE
-OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 
-CloseHandle = kernel32.CloseHandle
-CloseHandle.restype = wintypes.BOOL
-CloseHandle.argtypes = [wintypes.HANDLE]
-
-ReadProcessMemory = kernel32.ReadProcessMemory
-ReadProcessMemory.restype = wintypes.BOOL
-ReadProcessMemory.argtypes = [
-    wintypes.HANDLE,
-    wintypes.LPCVOID,
-    wintypes.LPVOID,
-    ctypes.c_size_t,
-    ctypes.POINTER(ctypes.c_size_t)
-]
-
-WriteProcessMemory = kernel32.WriteProcessMemory
-WriteProcessMemory.restype = wintypes.BOOL
-WriteProcessMemory.argtypes = [
-    wintypes.HANDLE,
-    wintypes.LPVOID,
-    wintypes.LPCVOID,
-    ctypes.c_size_t,
-    ctypes.POINTER(ctypes.c_size_t)
-]
-
-VirtualQueryEx = kernel32.VirtualQueryEx
-VirtualQueryEx.restype = ctypes.c_size_t
-VirtualQueryEx.argtypes = [
-    wintypes.HANDLE,
-    wintypes.LPCVOID,
-    ctypes.POINTER(MEMORY_BASIC_INFORMATION64),
-    ctypes.c_size_t
-]
-
-IsWow64Process = kernel32.IsWow64Process
-IsWow64Process.restype = wintypes.BOOL
-IsWow64Process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+def is_float_type(data_type: str) -> bool:
+    return data_type.lower() in _FLOAT_TYPES
 
 
 class ScanSession:
+    """Holds state for an ongoing memory-value search."""
+    __slots__ = ('data_type', 'matches', 'scan_count')
+
     def __init__(self, data_type: str):
         self.data_type = data_type
-        self.matches: Dict[int, Any] = {} # address -> last_val
-        self.scan_count = 0
+        self.matches: Dict[int, Any] = {}  # address -> last known value
+        self.scan_count: int = 0
 
 
 class GameMemoryEngine:
+    """Win32 process memory reader/writer with scanning and freezing."""
+
+    _CHUNK_SIZE = 2 * 1024 * 1024  # 2 MiB read chunks
+
     def __init__(self):
         self.pid: Optional[int] = None
         self.process_name: Optional[str] = None
@@ -104,13 +74,20 @@ class GameMemoryEngine:
         self._freeze_running = False
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _type_size_and_format(data_type: str) -> Tuple[int, str]:
+        return type_size_and_format(data_type)
+
+    # -- Process Management -------------------------------------------------
+
     def list_processes(self, filter_name: Optional[str] = None) -> List[Dict[str, Any]]:
         """Lists running processes matching an optional name filter."""
         results = []
+        needle = (filter_name or '').lower()
         for proc in psutil.process_iter(['pid', 'name', 'exe', 'username']):
             try:
                 name = proc.info['name'] or ''
-                if filter_name and filter_name.lower() not in name.lower():
+                if needle and needle not in name.lower():
                     continue
                 results.append({
                     "pid": proc.info['pid'],
@@ -123,22 +100,21 @@ class GameMemoryEngine:
         return results
 
     def attach(self, target: Any) -> Dict[str, Any]:
-        """Attaches to process by PID (int) or process name (str)."""
+        """Attaches to process by PID (int/str) or executable name."""
         target_pid = None
         target_name = None
 
         if isinstance(target, int) or (isinstance(target, str) and target.isdigit()):
             target_pid = int(target)
             try:
-                p = psutil.Process(target_pid)
-                target_name = p.name()
+                target_name = psutil.Process(target_pid).name()
             except Exception as e:
                 return {"success": False, "error": f"Failed to find PID {target_pid}: {e}"}
         else:
             target_name = str(target)
             for proc in psutil.process_iter(['pid', 'name']):
                 try:
-                    if proc.info['name'] and proc.info['name'].lower() == target_name.lower():
+                    if (proc.info['name'] or '').lower() == target_name.lower():
                         target_pid = proc.info['pid']
                         break
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -146,7 +122,7 @@ class GameMemoryEngine:
             if not target_pid:
                 return {"success": False, "error": f"No process named '{target_name}' found."}
 
-        # Close existing handle if attached
+        # Clean up existing handle and freeze state to avoid cross-process pollution
         if self.process_handle:
             try:
                 CloseHandle(self.process_handle)
@@ -154,10 +130,12 @@ class GameMemoryEngine:
                 pass
             self.process_handle = None
 
+        with self._lock:
+            self.frozen_values.clear()
+
         # Open process
         handle = OpenProcess(PROCESS_ALL_ACCESS, False, target_pid)
         if not handle:
-            # Fallback with less permissions if ALL_ACCESS denied
             handle = OpenProcess(
                 PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
                 False,
@@ -168,7 +146,7 @@ class GameMemoryEngine:
             err = ctypes.get_last_error()
             return {
                 "success": False,
-                "error": f"Failed to open process {target_pid} (Error code: {err}). Run with Admin privileges if needed."
+                "error": f"Failed to open process {target_pid} (Error code: {err}). Run with Administrator privileges."
             }
 
         self.pid = target_pid
@@ -208,12 +186,11 @@ class GameMemoryEngine:
                     "size": mod.SizeOfImage
                 })
         except Exception:
-            # Fallback via psutil memory maps
             try:
                 p = psutil.Process(self.pid)
                 for m in p.memory_maps():
                     modules.append({
-                        "name": m.path.split('\\')[-1] if m.path else "unknown",
+                        "name": m.path.rsplit('\\', 1)[-1] if m.path else "unknown",
                         "base_address": hex(m.addr),
                         "path": m.path
                     })
@@ -223,37 +200,16 @@ class GameMemoryEngine:
 
     def get_module_base(self, module_name: Optional[str] = None) -> Optional[int]:
         """Gets base address of the main executable or specific module."""
-        if not module_name:
-            module_name = self.process_name
+        name = (module_name or self.process_name or '').lower()
         for mod in self.list_modules():
-            if mod["name"].lower() == (module_name or '').lower():
+            if mod["name"].lower() == name:
                 return int(mod["base_address"], 16)
         return None
 
-    def _type_size_and_format(self, data_type: str) -> Tuple[int, str]:
-        t = data_type.lower()
-        if t in ('int', 'int32', 'i32'):
-            return 4, '<i'
-        elif t in ('uint', 'uint32', 'u32'):
-            return 4, '<I'
-        elif t in ('int64', 'i64', 'long'):
-            return 8, '<q'
-        elif t in ('uint64', 'u64', 'ulong'):
-            return 8, '<Q'
-        elif t in ('short', 'int16', 'i16'):
-            return 2, '<h'
-        elif t in ('ushort', 'uint16', 'u16'):
-            return 2, '<H'
-        elif t in ('byte', 'uint8', 'u8'):
-            return 1, '<B'
-        elif t in ('float', 'f32'):
-            return 4, '<f'
-        elif t in ('double', 'f64'):
-            return 8, '<d'
-        else:
-            raise ValueError(f"Unsupported data type: {data_type}")
+    # -- Raw Memory I/O -----------------------------------------------------
 
     def read_raw(self, address: int, size: int) -> Optional[bytes]:
+        """Reads raw bytes from target process memory."""
         if not self.process_handle:
             return None
         buffer = ctypes.create_string_buffer(size)
@@ -270,6 +226,7 @@ class GameMemoryEngine:
         return None
 
     def write_raw(self, address: int, data: bytes) -> bool:
+        """Writes raw bytes to target process memory."""
         if not self.process_handle:
             return False
         buffer = (ctypes.c_char * len(data)).from_buffer_copy(data)
@@ -283,13 +240,15 @@ class GameMemoryEngine:
         )
         return bool(res and bytes_written.value == len(data))
 
+    # -- Pointer Chains -----------------------------------------------------
+
     def resolve_pointer(self, base_address: int, offsets: List[int]) -> Optional[int]:
-        """Traverses a pointer chain: base -> ptr1 + offset1 -> ptr2 + offset2 -> final address."""
+        """Traverses a pointer chain: base -> [ptr1] + off1 -> [ptr2] + off2 -> final."""
         current_addr = base_address
         ptr_size = 8 if self.is_64bit else 4
         ptr_format = '<Q' if self.is_64bit else '<I'
 
-        for i, offset in enumerate(offsets):
+        for offset in offsets:
             raw = self.read_raw(current_addr, ptr_size)
             if not raw:
                 return None
@@ -298,6 +257,8 @@ class GameMemoryEngine:
                 return None
             current_addr = val + offset
         return current_addr
+
+    # -- Typed Memory Access ------------------------------------------------
 
     def read_memory(self, address: int, data_type: str, offsets: Optional[List[int]] = None) -> Dict[str, Any]:
         """Reads a typed value from an address (resolving optional pointer offsets)."""
@@ -309,16 +270,20 @@ class GameMemoryEngine:
             target_addr = resolved
 
         if data_type.lower() == 'string':
-            raw = self.read_raw(target_addr, 64)
+            raw = self.read_raw(target_addr, 256)
             if not raw:
                 return {"success": False, "error": "Failed to read memory"}
             null_pos = raw.find(b'\x00')
             if null_pos != -1:
                 raw = raw[:null_pos]
-            val_str = raw.decode('utf-8', errors='ignore')
+            val_str = raw.decode('utf-8', errors='replace')
             return {"success": True, "address": hex(target_addr), "value": val_str, "type": "string"}
 
-        size, fmt = self._type_size_and_format(data_type)
+        try:
+            size, fmt = type_size_and_format(data_type)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
         raw = self.read_raw(target_addr, size)
         if not raw:
             return {"success": False, "error": f"Failed to read {size} bytes at {hex(target_addr)}"}
@@ -337,66 +302,68 @@ class GameMemoryEngine:
         if data_type.lower() == 'string':
             data = str(value).encode('utf-8') + b'\x00'
         else:
-            size, fmt = self._type_size_and_format(data_type)
-            if 'float' in data_type.lower() or 'double' in data_type.lower():
-                val_num = float(value)
-            else:
-                val_num = int(value)
-            data = struct.pack(fmt, val_num)
+            try:
+                size, fmt = type_size_and_format(data_type)
+                val_num = float(value) if is_float_type(data_type) else int(value)
+                data = struct.pack(fmt, val_num)
+            except Exception as e:
+                return {"success": False, "error": f"Invalid value or data type: {e}"}
 
         if self.write_raw(target_addr, data):
             return {"success": True, "address": hex(target_addr), "written_value": value}
-        else:
-            return {"success": False, "error": f"Failed to write to {hex(target_addr)}"}
+        return {"success": False, "error": f"Failed to write to {hex(target_addr)}"}
+
+    # -- Memory Scanning Engine ---------------------------------------------
 
     def first_scan(self, scan_id: str, data_type: str, target_value: Any, max_matches: int = 50000) -> Dict[str, Any]:
         """Performs initial memory scan across committed writable memory pages."""
         if not self.process_handle:
             return {"success": False, "error": "No process attached"}
 
-        size, fmt = self._type_size_and_format(data_type)
-        if 'float' in data_type.lower() or 'double' in data_type.lower():
-            target = float(target_value)
-        else:
-            target = int(target_value)
-        packed_target = struct.pack(fmt, target)
+        try:
+            size, fmt = type_size_and_format(data_type)
+            target = float(target_value) if is_float_type(data_type) else int(target_value)
+            packed_target = struct.pack(fmt, target)
+        except Exception as e:
+            return {"success": False, "error": f"Invalid scan parameters: {e}"}
 
         session = ScanSession(data_type=data_type)
-        mbi = MEMORY_BASIC_INFORMATION64()
+        mbi = MEMORY_BASIC_INFORMATION()
         current_addr = 0
-        total_scanned_bytes = 0
-
-        # Writable memory protections
-        valid_protects = PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
 
         while VirtualQueryEx(self.process_handle, ctypes.c_void_p(current_addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
-            if (mbi.State == MEM_COMMIT) and (mbi.Protect & valid_protects) and not (mbi.Protect & PAGE_GUARD) and not (mbi.Protect & PAGE_NOACCESS):
+            if mbi.RegionSize == 0:
+                break
+
+            if (mbi.State == MEM_COMMIT) and (mbi.Protect & WRITABLE_PROTECTIONS) and not (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)):
                 region_size = mbi.RegionSize
-                # Read page in chunks (up to 2MB)
-                chunk_size = min(region_size, 2 * 1024 * 1024)
+                chunk_size = min(region_size, self._CHUNK_SIZE)
                 offset = 0
+
                 while offset < region_size:
                     to_read = min(chunk_size, region_size - offset)
                     base_chunk = mbi.BaseAddress + offset
                     data = self.read_raw(base_chunk, to_read)
+
                     if data:
-                        total_scanned_bytes += len(data)
-                        # Scan through data
                         pos = 0
                         while True:
                             pos = data.find(packed_target, pos)
                             if pos == -1:
                                 break
-                            # Ensure alignment
                             if pos % size == 0:
                                 match_addr = base_chunk + pos
                                 session.matches[match_addr] = target
                                 if len(session.matches) >= max_matches:
                                     break
-                            pos += 1
+                                pos += size
+                            else:
+                                pos += 1
+
                     if len(session.matches) >= max_matches:
                         break
                     offset += to_read
+
             if len(session.matches) >= max_matches:
                 break
             current_addr = mbi.BaseAddress + mbi.RegionSize
@@ -414,24 +381,23 @@ class GameMemoryEngine:
         }
 
     def next_scan(self, scan_id: str, scan_type: str = "exact", target_value: Optional[Any] = None) -> Dict[str, Any]:
-        """
-        Filters previous scan matches.
-        scan_type options: 'exact', 'increased', 'decreased', 'changed', 'unchanged'
-        """
+        """Filters previous scan matches."""
         if scan_id not in self.scans:
             return {"success": False, "error": f"Scan session '{scan_id}' not found"}
 
         session = self.scans[scan_id]
-        size, fmt = self._type_size_and_format(session.data_type)
+        size, fmt = type_size_and_format(session.data_type)
+        is_float = is_float_type(session.data_type)
 
         target = None
         if target_value is not None:
-            if 'float' in session.data_type.lower() or 'double' in session.data_type.lower():
-                target = float(target_value)
-            else:
-                target = int(target_value)
+            try:
+                target = float(target_value) if is_float else int(target_value)
+            except (ValueError, TypeError) as e:
+                return {"success": False, "error": f"Invalid target_value: {e}"}
 
         new_matches: Dict[int, Any] = {}
+        st = scan_type.lower()
 
         for addr, prev_val in session.matches.items():
             raw = self.read_raw(addr, size)
@@ -440,17 +406,22 @@ class GameMemoryEngine:
             cur_val = struct.unpack(fmt, raw)[0]
 
             keep = False
-            st = scan_type.lower()
             if st == "exact":
-                keep = (cur_val == target)
+                keep = math.isclose(cur_val, target, abs_tol=1e-4) if is_float else (cur_val == target)
             elif st == "increased":
-                keep = (cur_val > prev_val) if target is None else (cur_val == prev_val + target)
+                if target is None:
+                    keep = (cur_val > prev_val)
+                else:
+                    keep = math.isclose(cur_val, prev_val + target, abs_tol=1e-4) if is_float else (cur_val == prev_val + target)
             elif st == "decreased":
-                keep = (cur_val < prev_val) if target is None else (cur_val == prev_val - target)
+                if target is None:
+                    keep = (cur_val < prev_val)
+                else:
+                    keep = math.isclose(cur_val, prev_val - target, abs_tol=1e-4) if is_float else (cur_val == prev_val - target)
             elif st == "changed":
-                keep = (cur_val != prev_val)
+                keep = not math.isclose(cur_val, prev_val, abs_tol=1e-4) if is_float else (cur_val != prev_val)
             elif st == "unchanged":
-                keep = (cur_val == prev_val)
+                keep = math.isclose(cur_val, prev_val, abs_tol=1e-4) if is_float else (cur_val == prev_val)
 
             if keep:
                 new_matches[addr] = cur_val
@@ -471,51 +442,66 @@ class GameMemoryEngine:
             "sample_results": sample
         }
 
+    # -- High-Performance AOB Pattern Scanner -------------------------------
+
     def pattern_scan(self, pattern: str, module_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        AOB (Array of Bytes) pattern scan with wildcards ('??' or '?').
-        Example pattern: '48 8B 05 ?? ?? ?? ?? 48 85 C0'
-        """
+        """AOB pattern scan with wildcards ('??' or '?') using compiled regex for speed."""
         if not self.process_handle:
             return {"success": False, "error": "No process attached"}
 
         tokens = pattern.strip().split()
-        byte_pattern = []
-        mask = []
-        for t in tokens:
-            if t == '?' or t == '??':
-                byte_pattern.append(0)
-                mask.append(False)
-            else:
-                byte_pattern.append(int(t, 16))
-                mask.append(True)
+        if not tokens:
+            return {"success": False, "error": "Empty pattern"}
 
-        pat_len = len(byte_pattern)
-        pat_bytes = bytes(byte_pattern)
+        regex_parts = []
+        has_wildcards = False
+        try:
+            for t in tokens:
+                if t in ('?', '??'):
+                    regex_parts.append(b'.')
+                    has_wildcards = True
+                else:
+                    byte_val = int(t, 16)
+                    regex_parts.append(re.escape(bytes([byte_val])))
+        except ValueError as e:
+            return {"success": False, "error": f"Invalid hex in pattern: {e}"}
 
-        # Determine scan range (module or whole memory)
-        base_addr = self.get_module_base(module_name) or 0
-        current_addr = base_addr
-        mbi = MEMORY_BASIC_INFORMATION64()
+        compiled_regex = re.compile(b''.join(regex_parts), re.DOTALL)
 
+        if module_name:
+            base_addr = self.get_module_base(module_name) or 0
+            current_addr = base_addr
+            max_scan_addr = base_addr + 0x20000000
+        else:
+            current_addr = 0
+            max_scan_addr = 0x7FFFFFFF0000 if self.is_64bit else 0xFFFFFFFF
+        mbi = MEMORY_BASIC_INFORMATION()
         matches = []
 
         while VirtualQueryEx(self.process_handle, ctypes.c_void_p(current_addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
-            if (mbi.State == MEM_COMMIT) and not (mbi.Protect & PAGE_GUARD) and not (mbi.Protect & PAGE_NOACCESS):
-                data = self.read_raw(mbi.BaseAddress, mbi.RegionSize)
-                if data:
-                    data_len = len(data)
-                    for i in range(data_len - pat_len):
-                        match = True
-                        for j in range(pat_len):
-                            if mask[j] and data[i + j] != pat_bytes[j]:
-                                match = False
-                                break
-                        if match:
-                            matches.append(hex(mbi.BaseAddress + i))
+            if mbi.RegionSize == 0:
+                break
+
+            if (mbi.State == MEM_COMMIT) and not (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)):
+                # Chunked reading to avoid MemoryError on huge regions
+                region_size = mbi.RegionSize
+                chunk_size = min(region_size, self._CHUNK_SIZE)
+                offset = 0
+
+                while offset < region_size:
+                    to_read = min(chunk_size, region_size - offset)
+                    data = self.read_raw(mbi.BaseAddress + offset, to_read)
+                    if data:
+                        for m in compiled_regex.finditer(data):
+                            matches.append(hex(mbi.BaseAddress + offset + m.start()))
                             if len(matches) >= 50:
                                 break
-            if len(matches) >= 50 or (module_name and current_addr > base_addr + 0x20000000):
+                    if len(matches) >= 50:
+                        break
+                    # Overlap slightly for boundary patterns
+                    offset += max(1, to_read - len(tokens))
+
+            if len(matches) >= 50 or current_addr > max_scan_addr:
                 break
             current_addr = mbi.BaseAddress + mbi.RegionSize
 
@@ -526,13 +512,16 @@ class GameMemoryEngine:
             "addresses": matches
         }
 
+    # -- Value Freezing -----------------------------------------------------
+
     def freeze_value(self, address: int, data_type: str, value: Any, interval_ms: int = 50) -> Dict[str, Any]:
         """Freezes an address so its value is constantly rewritten."""
         with self._lock:
             self.frozen_values[address] = {
                 "type": data_type,
                 "value": value,
-                "interval": max(10, interval_ms) / 1000.0
+                "interval": max(10, interval_ms) / 1000.0,
+                "last_written": 0.0
             }
         return {"success": True, "address": hex(address), "frozen_to": value}
 
@@ -559,11 +548,20 @@ class GameMemoryEngine:
 
     def _freeze_loop(self):
         while self._freeze_running:
+            now = time.monotonic()
             with self._lock:
                 items = list(self.frozen_values.items())
+
+            if not items:
+                time.sleep(0.05)
+                continue
+
             for addr, meta in items:
-                try:
-                    self.write_memory(addr, meta["type"], meta["value"])
-                except Exception:
-                    pass
-            time.sleep(0.05)
+                if now - meta.get("last_written", 0.0) >= meta["interval"]:
+                    try:
+                        self.write_memory(addr, meta["type"], meta["value"])
+                        meta["last_written"] = now
+                    except Exception:
+                        pass
+
+            time.sleep(0.01)
