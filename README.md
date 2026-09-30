@@ -12,15 +12,20 @@ A Model Context Protocol (MCP) server that empowers Antigravity to act as an aut
 - **Signature / AOB Scanning**: Find static offsets and code hooks using pattern wildcards (`48 8B 05 ?? ?? ?? ??`).
 - **Direct Memory R/W**: Safely read and write primitive types.
 - **Value Freezing**: Background worker thread that constantly locks values to maintain God Mode / Infinite Ammo / Unlimited Gold.
+- **Lua Scripting Engine**: Run Lua scripts with Cheat Engine-compatible globals (`readInteger`, `writeInteger`, `readFloat`, `writeFloat`, `freeze`, `unfreeze`).
+- **Remote In-Game Lua Injection**: Execute Lua code inside games with embedded Lua states (`lua51.dll`, `luajit.dll`).
+- **Cheat Table (.CT) Support**: Load, parse, read, and activate Cheat Engine tables directly.
+- **DLL Injection**: Inject custom mod / trainer DLLs into game processes via Win32 `CreateRemoteThread`.
 
 ---
 
 ## MCP Tools Exposed to Antigravity
 
+### Memory & Process Tools
 | Tool Name | Description |
 | :--- | :--- |
 | `list_processes` | Search running Windows processes by name filter. |
-| `attach_process` | Attach to game process by executable name (e.g. `witcher3.exe`) or PID. |
+| `attach_process` | Attach to game process by executable name or PID. |
 | `list_modules` | List loaded modules and base addresses (useful for ASLR calculations). |
 | `first_scan` | Perform initial value scan across committed writable memory pages. |
 | `next_scan` | Filter previous scan results as in-game values change. |
@@ -31,16 +36,29 @@ A Model Context Protocol (MCP) server that empowers Antigravity to act as an aut
 | `unfreeze_value` | Stop freezing an address. |
 | `list_frozen` | Inspect currently locked memory addresses. |
 
+### Lua, Cheat Table & DLL Tools
+| Tool Name | Description |
+| :--- | :--- |
+| `execute_lua` | Execute Lua scripts with Cheat Engine memory bindings (`readInteger`, `writeInteger`, etc.). |
+| `inject_game_lua` | Run Lua scripts directly inside games with an embedded Lua runtime (`lua51.dll`, `luajit.dll`). |
+| `load_cheat_table` | Load and parse Cheat Engine `.CT` files or XML content. |
+| `list_cheat_table_entries` | View all variables, pointers, and resolved values in a loaded `.CT` table. |
+| `set_cheat_table_entry` | Modify or freeze values for specific entries in a Cheat Table. |
+| `inject_dll` | Inject any DLL into the attached game process using `CreateRemoteThread`. |
+
 ---
 
-## How to Use in Chat with Antigravity
+## Example Lua Usage
 
-Once connected, you can simply instruct Antigravity in plain English:
+```lua
+local hp_addr = "0x7FF712345678"
+local current_hp = readInteger(hp_addr)
+print("Current HP:", current_hp)
 
-1. *"Attach to Hades.exe and find my current health of 250."*
-2. *(Take some damage in-game to 220)* -> *"My health is now 220, filter the scan."*
-3. *"Set my health to 9999 and freeze it."*
-4. *"Find the base address for player ammo using the pointer offsets `[0x48, 0x10, 0x18]`."*
+-- Set HP and freeze
+writeInteger(hp_addr, 99999)
+freeze(hp_addr, "int32", 99999)
+```
 
 ---
 
@@ -48,5 +66,5 @@ Once connected, you can simply instruct Antigravity in plain English:
 
 Run the test suite against a simulated target game:
 ```powershell
-python test_suite.py
+python test_extended_features.py
 ```
