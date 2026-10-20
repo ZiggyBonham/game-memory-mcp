@@ -3,7 +3,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 [![MCP Protocol](https://img.shields.io/badge/MCP-Protocol-blueviolet.svg?style=flat)](https://modelcontextprotocol.io/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20x86-0078D6.svg?style=flat&logo=windows&logoColor=white)](https://microsoft.com)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat)](https://opensource.org/licenses/MIT)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg?style=flat)](https://www.gnu.org/licenses/gpl-3.0)
 
 A high-performance **Model Context Protocol (MCP)** server that equips **Antigravity** and LLM agents with native, real-time memory inspection, multi-stage value scanning, pointer chain traversal, Cheat Engine Table (`.CT`) execution, Lua scripting, reflective manual mapping, and stealth low-footprint operations for single-player games on Windows.
 
@@ -192,4 +192,4 @@ python test_optimizations.py
 
 ## 📄 License
 
-Distributed under the [MIT License](LICENSE). Copyright (c) 2026 Ziggy.
+Distributed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0). Copyright (c) 2026 Ziggy.
